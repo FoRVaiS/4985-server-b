@@ -1,196 +1,220 @@
 #include "networking.h"
-#include "utils.h"
-#include <arpa/inet.h>
 #include <errno.h>
-#include <memory.h>
-#include <netinet/in.h>
+#include <fcntl.h>
+#include <p101_c/p101_stdio.h>
+#include <p101_c/p101_stdlib.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <sys/socket.h>
+#include <string.h>
 #include <unistd.h>
 
-static void setup_addr(struct sockaddr_storage *sockaddr, socklen_t *socklen, const HOST *args);
+#define ERR_NONE 0
+#define ERR_NO_DIGITS 1
+#define ERR_OUT_OF_RANGE 2
+#define ERR_INVALID_CHARS 3
 
-int tcp_socket(struct sockaddr_storage *sockaddr, int *err)
+static void setup_network_address(struct sockaddr_storage *addr, socklen_t *addr_len, const char *address, in_port_t port, int *err);
+static int  setup_tcp_server(const struct sockaddr_storage *addr, socklen_t addr_len, int backlog, int *err);
+static int  connect_to_server(struct sockaddr_storage *addr, socklen_t addr_len, int *err);
+
+int tcp_server(const char *address, in_port_t port, int backlog, int *err)
 {
-    int sockfd;
+    struct sockaddr_storage addr;
+    socklen_t               addr_len;
+    int                     fd;
 
-    // Create TCP Socket
-    errno  = 0;
-    sockfd = socket(sockaddr->ss_family, SOCK_STREAM, 0);    // NOLINT(android-cloexec-socket)
-    if(sockfd < 0)
+    setup_network_address(&addr, &addr_len, address, port, err);
+
+    if(*err != 0)
+    {
+        fd = -1;
+        goto done;
+    }
+
+    fd = setup_tcp_server(&addr, addr_len, backlog, err);
+
+done:
+    return fd;
+}
+
+int tcp_client(const char *address, in_port_t port, int *err)
+{
+    struct sockaddr_storage addr;
+    socklen_t               addr_len;
+    int                     fd;
+
+    setup_network_address(&addr, &addr_len, address, port, err);
+
+    if(*err != 0)
+    {
+        fd = -1;
+        goto done;
+    }
+
+    fd = connect_to_server(&addr, addr_len, err);
+
+done:
+    return fd;
+}
+
+static void setup_network_address(struct sockaddr_storage *addr, socklen_t *addr_len, const char *address, in_port_t port, int *err)
+{
+    in_port_t net_port;
+
+    *addr_len = 0;
+    net_port  = htons(port);
+    memset(addr, 0, sizeof(*addr));
+
+    if(inet_pton(AF_INET, address, &(((struct sockaddr_in *)addr)->sin_addr)) == 1)
+    {
+        struct sockaddr_in *ipv4_addr;
+
+        ipv4_addr           = (struct sockaddr_in *)addr;
+        addr->ss_family     = AF_INET;
+        ipv4_addr->sin_port = net_port;
+        *addr_len           = sizeof(struct sockaddr_in);
+    }
+    else if((inet_pton(AF_INET6, address, &(((struct sockaddr_in6 *)addr)->sin6_addr)) == 1))
+    {
+        struct sockaddr_in6 *ipv6_addr;
+
+        ipv6_addr            = (struct sockaddr_in6 *)addr;
+        addr->ss_family      = AF_INET6;
+        ipv6_addr->sin6_port = net_port;
+        *addr_len            = sizeof(struct sockaddr_in6);
+    }
+    else
+    {
+        fprintf(stderr, "%s is not an IPv4 or an IPv6 address\n", address);
+        *err = errno;
+    }
+}
+
+int setSocketNonBlocking(int socket, int *err)
+{
+    int flags = fcntl(socket, F_GETFL, 0);
+    if(flags == -1)
     {
         *err = errno;
         return -1;
     }
-
-    return sockfd;
+    flags |= O_NONBLOCK;
+    if(fcntl(socket, F_SETFL, flags) == -1)
+    {
+        *err = errno;
+        return -1;
+    }
+    return 0;
 }
 
-int tcp_server(const Arguments *args)
+static int setSockReuse(int fd, int *err)
 {
-    int ISETOPTION = 1;
-    int err;
-
-    int                     sockfd;
-    struct sockaddr_storage sockaddr;
-    socklen_t               socklen;
-    HOST                    host;
-
-    // Setup socket address
-    socklen = 0;
-    memset(&sockaddr, 0, sizeof(struct sockaddr_storage));
-    host.addr = args->addr;
-    host.port = args->port;
-    setup_addr(&sockaddr, &socklen, &host);
-
-    // Create tcp socket
-    err    = 0;
-    sockfd = tcp_socket(&sockaddr, &err);
-    if(sockfd < 0)
+    int opt;
+    opt = 1;
+    if(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
     {
-        errno = err;
-        perror("tcp_server::socket");
-        sockfd = -1;
-        goto exit;
+        *err = errno;
+        return -1;
     }
-
-    // Allows for rebinding to address after non-graceful termination
-    errno = 0;
-    if(setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, (char *)&ISETOPTION, sizeof(ISETOPTION)) == -1)
-    {
-        perror("tcp_server::setsockopt");
-        sockfd = -2;
-        goto exit;
-    }
-
-    // Bind the socket
-    errno = 0;
-    if(bind(sockfd, (struct sockaddr *)&sockaddr, socklen) < 0)
-    {
-        perror("tcp_server::bind");
-        close(sockfd);
-        sockfd = -3;
-        goto exit;
-    }
-
-    // Enable client connections
-    errno = 0;
-    if(listen(sockfd, SOMAXCONN) < 0)
-    {
-        perror("tcp_server::listen");
-        close(sockfd);
-        sockfd = -4;
-        goto exit;
-    }
-
-exit:
-    return sockfd;
+    return 0;
 }
 
-int tcp_client(const Arguments *args)
+static int setup_tcp_server(const struct sockaddr_storage *addr, socklen_t addr_len, int backlog, int *err)
 {
-    int err;
+    int fd;
+    int result;
 
-    int                     sockfd;
-    struct sockaddr_storage sockaddr;
-    socklen_t               socklen;
-    HOST                    host;
+    fd = socket(addr->ss_family, SOCK_STREAM, 0);    // NOLINT(android-cloexec-socket)
 
-    // Setup socket address
-    socklen = 0;
-    memset(&sockaddr, 0, sizeof(struct sockaddr_storage));
-    host.addr = args->sm_addr;
-    host.port = args->sm_port;
-    setup_addr(&sockaddr, &socklen, &host);
-
-    // Create tcp socket
-    err    = 0;
-    sockfd = tcp_socket(&sockaddr, &err);
-    if(sockfd < 0)
+    if(fd == -1)
     {
-        errno = err;
-        perror("tcp_server::socket");
-        sockfd = -1;
-        goto exit;
+        *err = errno;
+        goto done;
     }
 
-    if(connect(sockfd, (struct sockaddr *)&sockaddr, socklen) < 0)
+    result = setSocketNonBlocking(fd, err);
+    if(result == -1)
     {
-        err = errno;
-        perror("tcp_client::connect");
-        errno = 0;
-        close(sockfd);
-        sockfd = -2;
-        goto exit;
+        goto done;
     }
 
-exit:
-    return sockfd;
+    result = setSockReuse(fd, err);
+
+    if(result == -1)
+    {
+        goto done;
+    }
+
+    result = bind(fd, (const struct sockaddr *)addr, addr_len);
+
+    if(result == -1)
+    {
+        *err = errno;
+        goto done;
+    }
+
+    result = listen(fd, backlog);
+
+    if(result == -1)
+    {
+        *err = errno;
+        goto done;
+    }
+
+done:
+    return fd;
 }
 
-/**
- * Sets up an IPv4 or IPv6 address in a socket address struct.
- */
-static void setup_addr(struct sockaddr_storage *sockaddr, socklen_t *socklen, const HOST *args)
+static int connect_to_server(struct sockaddr_storage *addr, socklen_t addr_len, int *err)
 {
-    if(is_ipv6(args->addr))
+    int fd;
+    int result;
+
+    fd = socket(addr->ss_family, SOCK_STREAM, 0);    // NOLINT(android-cloexec-socket)
+
+    if(fd == -1)
     {
-        struct sockaddr_in6 *addr = (struct sockaddr_in6 *)sockaddr;
-
-        inet_pton(AF_INET6, args->addr, &addr->sin6_addr);
-        addr->sin6_family = AF_INET6;
-        addr->sin6_port   = htons(args->port);
-
-        *socklen = sizeof(struct sockaddr_in6);
+        *err = errno;
+        goto done;
     }
-    else
+
+    result = connect(fd, (const struct sockaddr *)addr, addr_len);
+
+    if(result == -1)
     {
-        struct sockaddr_in *addr = (struct sockaddr_in *)sockaddr;
-
-        addr->sin_addr.s_addr = inet_addr(args->addr);
-        addr->sin_family      = AF_INET;
-        addr->sin_port        = htons(args->port);
-
-        *socklen = sizeof(struct sockaddr_in);
+        *err = errno;
+        close(fd);
+        fd = -1;
     }
+
+done:
+    return fd;
 }
 
-in_port_t convert_port(const char *str, int *err)
+ssize_t convert_port(const char *str, in_port_t *port)
 {
-    in_port_t port;
-    char     *endptr;
-    long      val;
+    char *endptr;
+    long  val;
 
-    *err  = 0;
-    port  = 0;
-    errno = 0;
-    val   = strtol(str, &endptr, 10);    // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
+    val = strtol(str, &endptr, 10);    // NOLINT(cppcoreguidelines-avoid-magic-numbers,readability-magic-numbers)
 
     // Check if no digits were found
     if(endptr == str)
     {
-        *err = -1;
-        goto done;
+        return ERR_NO_DIGITS;
     }
 
     // Check for out-of-range errors
     if(val < 0 || val > UINT16_MAX)
     {
-        *err = -2;
-        goto done;
+        return ERR_OUT_OF_RANGE;
     }
 
     // Check for trailing invalid characters
     if(*endptr != '\0')
     {
-        *err = -3;
-        goto done;
+        return ERR_INVALID_CHARS;
     }
 
-    port = (in_port_t)val;
-
-done:
-    return port;
+    *port = (in_port_t)val;
+    return ERR_NONE;
 }

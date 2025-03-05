@@ -23,10 +23,9 @@ _Noreturn void usage(const char *binary_name, int exit_code, const char *message
     exit(exit_code);
 }
 
-void get_arguments(Arguments *args, int argc, char *argv[])
+void get_arguments(args_t *args, int argc, char *argv[])
 {
     int opt;
-    int err;
 
     static struct option long_options[] = {
         {"address",    required_argument, NULL, 'a'},
@@ -45,9 +44,7 @@ void get_arguments(Arguments *args, int argc, char *argv[])
                 args->addr = optarg;
                 break;
             case 'p':
-                args->port = convert_port(optarg, &err);
-
-                if(err != 0)
+                if(convert_port(optarg, &args->port) != 0)
                 {
                     usage(argv[0], EXIT_FAILURE, "Port must be between 1 and 65535");
                 }
@@ -56,9 +53,7 @@ void get_arguments(Arguments *args, int argc, char *argv[])
                 args->sm_addr = optarg;
                 break;
             case 'P':
-                args->sm_port = convert_port(optarg, &err);
-
-                if(err != 0)
+                if(convert_port(optarg, &args->sm_port) != 0)
                 {
                     usage(argv[0], EXIT_FAILURE, "Port must be between 1 and 65535");
                 }
@@ -77,18 +72,5 @@ void get_arguments(Arguments *args, int argc, char *argv[])
             default:
                 usage(argv[0], EXIT_FAILURE, NULL);
         }
-    }
-}
-
-void validate_arguments(const char *binary_name, const Arguments *args)
-{
-    if(args->addr == NULL)
-    {
-        usage(binary_name, EXIT_FAILURE, "You must provide an ipv4 address to connect to.");
-    }
-
-    if(args->port == 0)
-    {
-        usage(binary_name, EXIT_FAILURE, "You must provide an available port to connect to.");
     }
 }

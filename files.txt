@@ -1,1 +1,1 @@
-main src/main.c src/networking.c include/networking.h src/utils.c include/utils.h src/messaging.c include/messaging.h  src/args.c include/args.h src/database.c include/database.h src/account.c include/account.h gdbm_compat
+server src/server.c src/networking.c include/networking.h src/utils.c include/utils.h src/messaging.c include/messaging.h src/args.c include/args.h src/database.c include/database.h src/account.c include/account.h src/fsm.c include/fsm.h src/io.c include/io.h src/chat.c include/chat.h gdbm_compat

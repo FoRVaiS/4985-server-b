@@ -1,16 +1,22 @@
 #include "messaging.h"
 #include "account.h"
+#include "chat.h"
+#include "database.h"
+#include "io.h"
 #include "utils.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <memory.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#define ERR_READ (-5)
+#define TIMEOUT 3000    // 3s
+
+static ssize_t execute_functions(request_t *request, const funcMapping functions[]);
 
 static const codeMapping code_map[] = {
     {OK,              ""                                  },
@@ -22,7 +28,7 @@ static const codeMapping code_map[] = {
     {REQUEST_TIMEOUT, "Request Timeout"                   }
 };
 
-static const char *code_to_string(const code_t *code)
+const char *code_to_string(const code_t *code)
 {
     for(size_t i = 0; i < sizeof(code_map) / sizeof(code_map[0]); i++)
     {
@@ -34,436 +40,407 @@ static const char *code_to_string(const code_t *code)
     return "UNKNOWN_STATUS";
 }
 
-ssize_t request_handler(int connfd)
+static const struct fsm_transition transitions[] = {
+    {START,            REQUEST_HANDLER,  request_handler },
+    {REQUEST_HANDLER,  HEADER_HANDLER,   header_handler  },
+    {HEADER_HANDLER,   BODY_HANDLER,     body_handler    },
+    {BODY_HANDLER,     PROCESS_HANDLER,  process_handler },
+    {PROCESS_HANDLER,  RESPONSE_HANDLER, response_handler},
+    {RESPONSE_HANDLER, END,              NULL            },
+    {REQUEST_HANDLER,  ERROR_HANDLER,    error_handler   },
+    {HEADER_HANDLER,   ERROR_HANDLER,    error_handler   },
+    {BODY_HANDLER,     ERROR_HANDLER,    error_handler   },
+    {PROCESS_HANDLER,  ERROR_HANDLER,    error_handler   },
+    {ERROR_HANDLER,    END,              NULL            },
+};
+
+static ssize_t execute_functions(request_t *request, const funcMapping functions[])
 {
-    ssize_t retval;
-    int     err;
-
-    request_t  request;
-    header_t   req_header;
-    response_t response;
-    header_t   res_header;
-    uint8_t   *buf;
-    code_t     code;
-    size_t     response_len;
-    uint8_t   *res_buf;
-
-    err                          = 0;
-    code                         = OK;
-    request.header               = &req_header;
-    request.header_len           = sizeof(header_t);
-    response.header              = &res_header;
-    response.header->payload_len = 3;
-    response.code                = &code;
-    response_len                 = sizeof(header_t);
-
-    request.body = (body_t *)malloc(sizeof(body_t));
-    if(!request.body)
+    for(size_t i = 0; functions[i].type != SYS_Success; i++)
     {
-        perror("Failed to allocate request body");
-        retval = -1;
-        goto done;
+        if(request->type == functions[i].type)
+        {
+            return functions[i].func(request);
+        }
+    }
+    printf("Not builtin command: %d\n", *(uint8_t *)request->content);
+    return 1;
+}
+
+void error_response(request_t *request)
+{
+    char *ptr;
+
+    // server default to 0
+    uint16_t    sender_id = SERVER_ID;
+    const char *msg;
+    uint8_t     msg_len;
+
+    ptr = (char *)request->response;
+    // tag
+    *ptr++ = SYS_Error;
+    // version
+    *ptr++ = TWO;
+
+    // sender_id
+    sender_id = htons(sender_id);
+    memcpy(ptr, &sender_id, sizeof(sender_id));
+    ptr += sizeof(sender_id);
+
+    msg     = code_to_string(&request->code);
+    msg_len = (uint8_t)strlen(msg);
+
+    request->response_len = (uint16_t)(request->response_len + (sizeof(uint8_t) + sizeof(uint8_t) + msg_len));
+
+    // payload len
+    request->response_len = htons(request->response_len);
+    memcpy(ptr, &request->response_len, sizeof(request->response_len));
+    ptr += sizeof(request->response_len);
+
+    *ptr++ = INTEGER;
+    *ptr++ = sizeof(uint8_t);
+
+    memcpy(ptr, &request->code, sizeof(uint8_t));
+    ptr += sizeof(uint8_t);
+
+    *ptr++ = UTF8STRING;
+    memcpy(ptr, &msg_len, sizeof(msg_len));
+    ptr += sizeof(msg_len);
+
+    memcpy(ptr, msg, msg_len);
+}
+
+void event_loop(int server_fd, int *err)
+{
+    struct pollfd fds[MAX_FDS];
+    int           sessions[MAX_FDS];
+    int           client_fd;
+    int           added;
+    int           user_count;
+    char          db_name[] = "meta_user";
+    DBO           meta_userDB;
+    ssize_t       result;
+
+    meta_userDB.name = db_name;
+
+    if(init_pk(&meta_userDB, USER_PK, &user_count) < 0)
+    {
+        perror("init_pk error\n");
+        goto cleanup;
     }
 
-    response.body = (res_body_t *)malloc(sizeof(res_body_t));
-    if(!response.body)
+    if(database_open(&meta_userDB, err) < 0)
     {
-        perror("Failed to allocate response body");
-        retval = -1;
-        goto error1;
+        perror("database error");
+        goto cleanup;
     }
 
-    buf = (uint8_t *)calloc(request.header_len, sizeof(uint8_t));
+    fds[0].fd     = server_fd;
+    fds[0].events = POLLIN;
+    for(int i = 1; i < MAX_FDS; i++)
+    {
+        fds[i].fd   = -1;
+        sessions[i] = -1;
+    }
+
+    while(running)
+    {
+        errno  = 0;
+        result = poll(fds, MAX_FDS, TIMEOUT);
+        if(result == -1)
+        {
+            if(errno == EINTR)
+            {
+                goto cleanup;
+            }
+            perror("Poll error");
+            goto cleanup;
+        }
+        if(result == 0)
+        {
+            printf("syncing meta_user...\n");
+            // update user index
+            if(store_int(meta_userDB.db, USER_PK, user_count) != 0)
+            {
+                perror("update user_index");
+                goto cleanup;
+            }
+            continue;
+        }
+
+        // Check for new connection
+        if(fds[0].revents & POLLIN)
+        {
+            client_fd = accept(server_fd, NULL, 0);
+            if(client_fd < 0)
+            {
+                if(errno == EINTR)
+                {
+                    goto cleanup;
+                }
+                perror("Accept failed");
+                continue;
+            }
+
+            // Add new client to poll list
+            added = 0;
+            for(int i = 1; i < MAX_FDS; i++)
+            {
+                if(fds[i].fd == -1)
+                {
+                    fds[i].fd     = client_fd;
+                    fds[i].events = POLLIN;
+                    added         = 1;
+                    break;
+                }
+            }
+            if(!added)
+            {
+                char too_many[] = "Too many clients, rejecting connection\n";
+
+                printf("%s", too_many);
+                write_fully(client_fd, &too_many, (ssize_t)strlen(too_many), err);
+
+                close(client_fd);
+                continue;
+            }
+        }
+
+        // Check existing clients for data
+        for(int i = 1; i < MAX_FDS; i++)
+        {
+            if(fds[i].fd != -1)
+            {
+                if(fds[i].revents & POLLIN)
+                {
+                    request_t      request;
+                    fsm_state_func perform;
+                    fsm_state_t    from_id;
+                    fsm_state_t    to_id;
+
+                    from_id = START;
+                    to_id   = REQUEST_HANDLER;
+
+                    request.err       = 0;
+                    request.client_fd = &fds[i].fd;
+                    // user_id
+                    request.session_id   = &sessions[i];
+                    request.user_count   = &user_count;
+                    request.len          = HEADER_SIZE;
+                    request.response_len = 3;
+                    request.fds          = fds;
+                    request.content      = malloc(HEADER_SIZE);
+                    if(request.content == NULL)
+                    {
+                        perror("Malloc failed to allocate memory\n");
+                        close(fds[i].fd);
+                        fds[i].fd   = -1;
+                        sessions[i] = -1;
+                        continue;
+                    }
+
+                    memset(request.response, 0, RESPONSE_SIZE);
+
+                    request.code = OK;
+
+                    printf("event_loop session_id %d\n", *request.session_id);
+
+                    do
+                    {
+                        perform = fsm_transition(from_id, to_id, transitions, sizeof(transitions));
+                        if(perform == NULL)
+                        {
+                            printf("illegal state %d, %d \n", from_id, to_id);
+                            free(request.content);
+                            close(*request.client_fd);
+                            *request.client_fd = -1;
+                            break;
+                        }
+                        // printf("from_id %d\n", from_id);
+                        from_id = to_id;
+                        to_id   = perform(&request);
+                    } while(to_id != END);
+                }
+                if(fds[i].revents & (POLLHUP | POLLERR))
+                {
+                    // Client disconnected or error, close and clean up
+                    printf("oops...\n");
+                    close(fds[i].fd);
+                    fds[i].fd = -1;
+                    continue;
+                }
+            }
+        }
+    }
+
+    printf("syncing meta_user...\n");
+    // update user index
+    if(store_int(meta_userDB.db, USER_PK, user_count) != 0)
+    {
+        perror("update user_index");
+        goto cleanup;
+    }
+    dbm_close(meta_userDB.db);
+
+cleanup:
+    printf("syncing meta_user in cleanup...\n");
+    store_int(meta_userDB.db, USER_PK, user_count);
+    dbm_close(meta_userDB.db);
+}
+
+fsm_state_t request_handler(void *args)
+{
+    request_t *request;
+    ssize_t    nread;
+
+    request = (request_t *)args;
+    printf("in request_handler %d\n", *request->client_fd);
+
+    // Read first 6 bytes from fd
+    errno = 0;
+    nread = read_fully(*request->client_fd, (char *)request->content, request->len, &request->err);
+    printf("request_handler nread %d\n", (int)nread);
+    if(nread < 0)
+    {
+        perror("Read_fully error\n");
+        return ERROR_HANDLER;
+    }
+
+    if(nread < (ssize_t)request->len)
+    {
+        request->code = INVALID_REQUEST;
+        return ERROR_HANDLER;
+    }
+    return HEADER_HANDLER;
+}
+
+fsm_state_t header_handler(void *args)
+{
+    request_t *request;
+
+    uint16_t sender_id;
+    uint16_t len;
+    char    *ptr;
+
+    request = (request_t *)args;
+
+    printf("in header_handler %d\n", *request->client_fd);
+
+    ptr = (char *)request->content;
+
+    memcpy(&request->type, ptr, sizeof(request->type));
+    ptr += sizeof(request->type) + sizeof(uint8_t);
+
+    memcpy(&sender_id, ptr, sizeof(sender_id));
+    request->sender_id = ntohs(sender_id);
+    ptr += sizeof(sender_id);
+
+    printf("sender_id: %u\n", request->sender_id);
+
+    memcpy(&len, ptr, sizeof(len));
+    // printf("len size (before ntohs): %u\n", len);
+    request->len = ntohs(len);
+    printf("len size (after ntohs): %u\n", (uint16_t)request->len);
+
+    return BODY_HANDLER;
+}
+
+fsm_state_t body_handler(void *args)
+{
+    request_t *request;
+    ssize_t    nread;
+    void      *buf;
+
+    request = (request_t *)args;
+    printf("in header_handler %d\n", *request->client_fd);
+
+    printf("len size: %u\n", (uint16_t)(request->len + HEADER_SIZE));
+
+    buf = realloc(request->content, request->len + HEADER_SIZE);
     if(!buf)
     {
-        perror("Failed to allocate buf");
-        retval = -1;
-        goto error2;
+        perror("Failed to realloc buf");
+        return ERROR_HANDLER;
     }
+    request->content = buf;
 
-    if(read_packet(connfd, &buf, &request, &response, &err) < 0)
-    {
-        errno = err;
-        perror("request_handler::read_fd_until_eof");
-        retval = -1;
-        goto error3;
-    }
-
-    packet_handler(&request, &response, &err);
-
-    // errno = 0;
-    if(create_response(&request, &response, &res_buf, &response_len, &err) < 0)
-    {
-        errno = err;
-        perror("request_handler::packet_handler");
-        retval = -1;
-        goto error4;
-    }
-
-    sent_response(connfd, res_buf, &response_len);
-
-    retval = EXIT_SUCCESS;
-
-error4:
-    free(res_buf);
-error3:
-    free(buf);
-error2:
-    free(response.body);
-error1:
-    free(request.body);
-done:
-    return retval;
-}
-
-ssize_t read_packet(int fd, uint8_t **buf, request_t *request, response_t *response, int *err)
-{
-    size_t header_len = request->header_len;
-
-    uint16_t payload_len;
-    ssize_t  nread;
-
-    // Read header_len bytes from fd
-    errno = 0;
-    nread = read(fd, *buf, header_len);
+    nread = read_fully(*request->client_fd, (char *)request->content + HEADER_SIZE, request->len, &request->err);
     if(nread < 0)
     {
-        *err = errno;
-        perror("read_packet::read");
-        *(response->code) = SERVER_ERROR;
-        return -1;
+        perror("Read_fully error\n");
+        return ERROR_HANDLER;
     }
 
-    // Deserialize header to reload payload length
-    if(deserialize_header(request->header, response, *buf, nread) < 0)
-    {
-        // If what was read is lower than expected, the header is incomplete
-        fprintf(stderr, "read_packet::nread<header_len: Message read was too short to be a header.\n");
-        return -2;
-    }
-
-    // Pull the length of the payload
-    payload_len = request->header->payload_len; /* header->size */
-
-    if(!payload_len)
-    {
-        return 0;
-    }
-
-    // Allocate another payload_length bytes to buffer
-    {
-        uint8_t *newbuf;
-
-        newbuf = (uint8_t *)realloc(*buf, header_len + payload_len);
-        if(newbuf == NULL)
-        {
-            perror("read_packet::realloc");
-            *(response->code) = SERVER_ERROR;
-            return -4;
-        }
-        *buf = newbuf;
-    }
-
-    // Read payload_length into buffer
-    errno = 0;
-    nread = read(fd, *buf + header_len, payload_len);
-    if(nread < 0)
-    {
-        *err = errno;
-        perror("read_packet::read");
-        *(response->code) = SERVER_ERROR;
-        return ERR_READ;
-    }
-
-    if(deserialize_body(request, response, *buf + header_len, nread, err) < 0)
-    {
-        // If what was read is lower than expected, the header is incomplete
-        fprintf(stderr, "read_packet::body length mismatch\n");
-        return -2;
-    }
-
-    return 0;
+    return PROCESS_HANDLER;
 }
 
-ssize_t deserialize_header(header_t *header, response_t *response, const uint8_t *buf, ssize_t nread)
+fsm_state_t process_handler(void *args)
 {
-    size_t offset;
+    request_t *request;
+    ssize_t    result;
 
-    offset = 0;
+    request = (request_t *)args;
 
-    if(nread < (ssize_t)sizeof(header_t))
+    printf("in process_handler %d\n", *request->client_fd);
+
+    result = execute_functions(request, acc_func);
+    if(result <= 0)
     {
-        *(response->code) = INVALID_REQUEST;
-        return -1;
+        return (result < 0) ? ERROR_HANDLER : RESPONSE_HANDLER;
     }
 
-    memcpy(&header->type, buf + offset, sizeof(header->type));
-    offset += sizeof(header->type);
+    result = execute_functions(request, chat_func);
+    if(result <= 0)
+    {
+        return (result < 0) ? ERROR_HANDLER : RESPONSE_HANDLER;
+    }
 
-    memcpy(&header->version, buf + offset, sizeof(header->version));
-    offset += sizeof(header->version);
-
-    memcpy(&header->sender_id, buf + offset, sizeof(header->sender_id));
-    offset += sizeof(header->sender_id);
-    header->sender_id = ntohs(header->sender_id);
-
-    memcpy(&header->payload_len, buf + offset, sizeof(header->payload_len));
-    header->payload_len = ntohs(header->payload_len);
-
-    printf("header->type: %d\n", (int)header->type);
-    printf("header->version: %d\n", (int)header->version);
-    printf("header->sender_id: %d\n", (int)header->sender_id);
-    printf("header->payload_len: %d\n", (int)header->payload_len);
-
-    return 0;
+    request->code = INVALID_REQUEST;
+    return ERROR_HANDLER;
 }
 
-ssize_t deserialize_body(request_t *request, response_t *response, const uint8_t *buf, ssize_t nread, int *err)
+fsm_state_t response_handler(void *args)
 {
-    if(nread < (ssize_t)request->header->payload_len)
+    request_t *request;
+
+    request = (request_t *)args;
+
+    printf("in response_handler %d\n", *request->client_fd);
+
+    if(request->type != CHT_Send)
     {
-        printf("body too short\n");
-        *err              = EINVAL;
-        *(response->code) = INVALID_REQUEST;
-        return -1;
+        request->response_len = (uint16_t)(HEADER_SIZE + ntohs(request->response_len));
+        printf("response_len: %d\n", (request->response_len));
+
+        write_fully(*request->client_fd, request->response, request->response_len, &request->err);
     }
 
-    printf("type: %d\n", (int)request->header->type);
+    free(request->content);
 
-    if(request->header->type == ACC_Create || request->header->type == ACC_Login)
-    {
-        size_t offset;
-        acc_t *acc;
-
-        acc = (acc_t *)malloc(sizeof(acc_t));
-        if(!acc)
-        {
-            perror("Failed to allocate acc_t");
-            *err              = errno;
-            *(response->code) = SERVER_ERROR;
-            return -1;
-        }
-        memset(acc, 0, sizeof(acc_t));
-
-        offset = 0;
-        // Deserialize username tag
-        memcpy(&acc->username_tag, buf + offset, sizeof(acc->username_tag));
-        offset += sizeof(acc->username_tag);
-
-        // printf("tag: %d\n", (int)acc->username_tag);
-
-        // Deserialize username length
-        memcpy(&acc->username_len, buf + offset, sizeof(acc->username_len));
-        offset += sizeof(acc->username_len);
-
-        // printf("len: %d\n", (int)acc->username_len);
-
-        // Deserialize username
-        acc->username = (uint8_t *)malloc((size_t)acc->username_len + 1);
-        if(!acc->username)
-        {
-            perror("Failed to allocate username");
-            free(acc);
-            *err              = errno;
-            *(response->code) = SERVER_ERROR;
-            return -1;
-        }
-        memcpy(acc->username, buf + offset, acc->username_len);
-        acc->username[acc->username_len] = '\0';
-        offset += acc->username_len;
-
-        // printf("username: %s\n", acc->username);
-
-        // Deserialize username tag
-        memcpy(&acc->password_tag, buf + offset, sizeof(acc->password_tag));
-        offset += sizeof(acc->password_tag);
-
-        // printf("password_tag: %d\n", (int)acc->password_tag);
-
-        // Deserialize password length
-        memcpy(&acc->password_len, buf + offset, sizeof(acc->password_len));
-        offset += sizeof(acc->password_len);
-
-        // printf("password_len: %d\n", (int)acc->password_len);
-
-        // Deserialize password
-        acc->password = (uint8_t *)malloc((size_t)acc->password_len + 1);
-        if(!acc->password)
-        {
-            perror("Failed to allocate password");
-            free(acc->username);
-            free(acc);
-            *err              = errno;
-            *(response->code) = SERVER_ERROR;
-            return -1;
-        }
-        memcpy(acc->password, buf + offset, acc->password_len);
-        acc->password[acc->password_len] = '\0';
-
-        free(request->body);
-        request->body = (body_t *)acc;
-
-        // printf("password: %s\n", acc->password);
-
-        return 0;
-    }
-
-    printf("Unknown type: 0x%X\n", request->header->type);
-    *(response->code) = INVALID_REQUEST;
-    return -1;
+    // for linux
+    close(*request->client_fd);
+    *request->client_fd = -1;
+    return END;
 }
 
-ssize_t serialize_header(const response_t *response, uint8_t *buf)
+fsm_state_t error_handler(void *args)
 {
-    size_t offset;
+    request_t *request;
 
-    offset = 0;
+    request = (request_t *)args;
+    printf("in error_handler %d: %d\n", *request->client_fd, (int)request->code);
 
-    memcpy(buf + offset, &response->header->type, sizeof(response->header->type));
-    offset += sizeof(response->header->type);
-
-    memcpy(buf + offset, &response->header->version, sizeof(response->header->version));
-    offset += sizeof(response->header->version);
-
-    response->header->sender_id = htons(response->header->sender_id);
-    memcpy(buf + offset, &response->header->sender_id, sizeof(response->header->sender_id));
-    offset += sizeof(response->header->sender_id);
-
-    response->header->payload_len = htons(response->header->payload_len);
-    memcpy(buf + offset, &response->header->payload_len, sizeof(response->header->payload_len));
-
-    return 0;
-}
-
-ssize_t serialize_body(const response_t *response, uint8_t *buf)
-{
-    size_t offset;
-
-    offset = 0;
-
-    memcpy(buf + offset, &response->body->tag, sizeof(response->body->tag));
-    offset += sizeof(response->body->tag);
-
-    memcpy(buf + offset, &response->body->len, sizeof(response->body->len));
-    offset += sizeof(response->body->len);
-
-    memcpy(buf + offset, &response->body->value, sizeof(response->body->value));
-    offset += sizeof(response->body->value);
-
-    printf("%d\n", (int)offset);
-    response->header->payload_len = htons(response->header->payload_len);
-    printf("%d\n", (int)response->header->payload_len);
-
-    if(response->header->payload_len > offset)
+    if(request->type != ACC_Logout)
     {
-        memcpy(buf + offset, &response->body->msg_tag, sizeof(response->body->msg_tag));
-        offset += sizeof(response->body->msg_tag);
-
-        memcpy(buf + offset, &response->body->msg_len, sizeof(response->body->msg_len));
-        offset += sizeof(response->body->msg_len);
-
-        memcpy(buf + offset, code_to_string(response->code), response->header->payload_len - offset);
+        error_response(request);
+        request->response_len = (uint16_t)(HEADER_SIZE + ntohs(request->response_len));
     }
+    printf("response_len: %d\n", (request->response_len));
 
-    return 0;
-}
+    write_fully(*request->client_fd, request->response, request->response_len, &request->err);
 
-ssize_t create_response(const request_t *request, response_t *response, uint8_t **buf, size_t *response_len, int *err)
-{
-    uint8_t    *newbuf;
-    const char *msg;
-
-    printf("response_len before: %d\n", (int)*response_len);
-
-    *response_len = (size_t)(request->header_len + response->header->payload_len);
-    printf("response_len: %d\n", (int)*response_len);
-
-    *buf = (uint8_t *)malloc(*response_len);
-    if(*buf == NULL)
-    {
-        perror("read_packet::realloc");
-        *(response->code) = SERVER_ERROR;
-        *err              = errno;
-        return -1;
-    }
-
-    msg = code_to_string(response->code);
-
-    // tag
-    response->body->msg_tag = (uint8_t)UTF8STRING;
-    // len
-    response->body->msg_len = (uint8_t)(strlen(msg));
-    printf("msg_len: %d\n", (int)response->body->msg_len);
-    // msg
-
-    *response_len = *response_len + response->body->msg_len + 2;
-    printf("response_len final: %d\n", (int)*response_len);
-
-    if(*response->code == OK)
-    {
-        response->header->type      = ACC_Login_Success;
-        response->header->version   = ONE;
-        response->header->sender_id = 0x00;
-        // logout has no response body
-        if(request->header->type == ACC_Logout)
-        {
-            response->header->payload_len = 0;
-            *response_len                 = *response_len - 2 - 3;
-        }
-        else
-        {
-            // ok has no msg
-            response->header->payload_len = (uint16_t)3;
-            // no msg tag & msg len
-            *response_len -= 2;
-        }
-    }
-    else if(*response->code == INVALID_AUTH)
-    {
-        printf("*response->code == INVALID_AUTH\n");
-
-        response->header->type        = SYS_Error;
-        response->header->version     = ONE;
-        response->header->sender_id   = 0x00;
-        response->header->payload_len = (uint16_t)(3 + response->body->msg_len + 2);
-
-        newbuf = (uint8_t *)realloc(*buf, *response_len);
-        if(newbuf == NULL)
-        {
-            perror("read_packet::realloc");
-            *(response->code) = SERVER_ERROR;
-            return -4;
-        }
-        *buf = newbuf;
-    }
-    else
-    {
-        printf("*response->code == else \n");
-        response->header->type        = SYS_Error;
-        response->header->version     = ONE;
-        response->header->sender_id   = 0x00;
-        response->header->payload_len = (uint16_t)(3 + response->body->msg_len + 2);
-
-        newbuf = (uint8_t *)realloc(*buf, *response_len);
-        if(newbuf == NULL)
-        {
-            perror("read_packet::realloc");
-            *(response->code) = SERVER_ERROR;
-            return -4;
-        }
-        *buf = newbuf;
-    }
-
-    serialize_header(response, *buf);
-    serialize_body(response, *buf + sizeof(header_t));
-    return 0;
-}
-
-ssize_t sent_response(int fd, const uint8_t *buf, const size_t *response_len)
-{
-    ssize_t result;
-
-    result = write(fd, buf, *response_len);
-    printf("\n%d\n", (int)result);
-    return 0;
+    free(request->content);
+    close(*request->client_fd);
+    *request->client_fd = -1;
+    return END;
 }
